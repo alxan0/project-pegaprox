@@ -931,6 +931,227 @@ def _create_ct():
     return {'success': True, 'vmid': new_vmid, 'cluster_id': cluster_id, 'hostname': hostname}
 
 
+def _vm_templates(mgr, vc):
+    """The admin-whitelisted template VMIDs that really are templates on the configured node,
+    as {vmid: row}. A whitelisted id is left out when no VM has it any more or its VM is not
+    a template, so the form never offers one the create would refuse."""
+    allowed = {int(t) for t in (vc.get('templates') or [])}
+    return {r['vmid']: r for r in (mgr.get_vm_resources(max_age=30) or [])
+            if r.get('type') == 'qemu' and r.get('template') and r.get('vmid') in allowed
+            and r.get('node') == vc.get('node')}
+
+
+def _vm_create_options():
+    """Twin of _ct_create_options for VMs cloned from an admin-whitelisted QEMU template."""
+    username = request.session.get('user', '')
+    if not username:
+        return {'error': 'Not authenticated', 'code': 'AUTH_REQUIRED'}, 401
+    user = _portal_user(username)
+    from pegaprox.models.permissions import ROLE_ADMIN
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+        return {'redirect': '/', 'reason': 'admin'}
+    cfg = _load_config(); vc = cfg.get('vm_create') or {}
+    enabled = bool(cfg.get('allow_vm_create')) and bool(vc.get('cluster_id')) and bool(vc.get('node'))
+    templates = []
+    mgr = cluster_managers.get(vc.get('cluster_id')) if enabled else None
+    if mgr and mgr.is_connected:
+        try:
+            templates = [{'vmid': vmid, 'name': r.get('name') or f'Template {vmid}',
+                          'disk_gb': int((r.get('maxdisk') or 0) / 1024 ** 3)}
+                         for vmid, r in sorted(_vm_templates(mgr, vc).items())]
+        except Exception:
+            logging.exception('[client_portal] could not list the VM templates')
+    out = {
+        'enabled': enabled,
+        'templates': templates,
+        'max_cores': int(vc.get('max_cores', 2) or 2),
+        'max_memory_mb': int(vc.get('max_memory_mb', 2048) or 2048),
+        'max_disk_gb': int(vc.get('max_disk_gb', 32) or 32),
+    }
+    tenant_id = user.get('tenant_id')
+    if tenant_id:
+        try:
+            from pegaprox.utils.rbac import check_tenant_quota
+            q = check_tenant_quota(tenant_id, add_vms=0, force=True)
+            out['quota'] = q.get('quota', {}); out['usage'] = q.get('usage', {})
+        except Exception:
+            pass
+    return out
+
+
+def _next_tenant_vmid(mgr, tenant_id):
+    """The next free VMID inside the tenant's range, PVE's next id when it has none. None when
+    the range is full. Same walk as the dashboard's nextid route (api/vms.py)."""
+    from pegaprox.utils.rbac import tenant_vmid_range
+    start, end = tenant_vmid_range(tenant_id)
+    if not start:
+        res = mgr.get_next_vmid()
+        return res['vmid'] if res.get('success') else None
+    taken = set()
+    for vm in (mgr.get_vm_resources() or []):
+        try:
+            taken.add(int(vm.get('vmid')))
+        except (TypeError, ValueError):
+            continue
+    return next((v for v in range(start, end + 1) if v not in taken), None)
+
+
+def _create_vm():
+    """Portal self-service: clone a VM from an admin-whitelisted QEMU template, within the
+    tenant quota and the hoster's caps, the VM twin of _create_ct. Cluster, node and storage
+    are admin-configured and the NIC comes with the template; the user picks the template,
+    cores/memory/disk and the cloud-init login. The clone, its config and the disk resize all
+    finish before the answer, so a failure on the way removes the half-made VM instead of
+    leaving it to the customer."""
+    username = request.session.get('user', '')
+    if not username:
+        return {'error': 'Not authenticated', 'code': 'AUTH_REQUIRED'}, 401
+    user = _portal_user(username)
+    from pegaprox.models.permissions import ROLE_ADMIN
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+        return {'redirect': '/', 'reason': 'admin'}
+
+    cfg = _load_config(); vc = cfg.get('vm_create') or {}
+    if not cfg.get('allow_vm_create') or not vc.get('cluster_id') or not vc.get('node'):
+        return {'error': 'VM creation is not enabled'}, 403
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return {'error': 'Expected a JSON object'}, 400
+    try:
+        template = int(data.get('template'))
+        cores = int(data.get('cores', 1)); memory = int(data.get('memory', 1024)); disk = int(data.get('disk_gb', 8))
+    except (ValueError, TypeError):
+        return {'error': 'Template / cores / memory / disk must be numbers'}, 400
+    max_cores = int(vc.get('max_cores', 2) or 2)
+    max_mem = int(vc.get('max_memory_mb', 2048) or 2048)
+    max_disk = int(vc.get('max_disk_gb', 32) or 32)
+    if not (1 <= cores <= max_cores):   return {'error': f'Cores must be between 1 and {max_cores}'}, 400
+    if not (512 <= memory <= max_mem):  return {'error': f'Memory must be between 512 and {max_mem} MB'}, 400
+    if not (1 <= disk <= max_disk):     return {'error': f'Disk must be between 1 and {max_disk} GB'}, 400
+    hostname = (data.get('hostname') or '').strip()
+    if not re.fullmatch(r'[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?', hostname):
+        return {'error': 'Invalid hostname — letters/digits/hyphens only, must start and end alphanumeric'}, 400
+    ciuser = (data.get('username') or '').strip()
+    if not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', ciuser) or ciuser == 'root':
+        return {'error': 'Invalid user name — lowercase letters, digits, - and _, not root'}, 400
+    password = data.get('password') or ''
+    if not isinstance(password, str):
+        return {'error': 'Password must be a string'}, 400
+    if len(password) < 8:
+        return {'error': 'Password must be at least 8 characters'}, 400
+    # PVE's crypt() would end the password at a NUL, the user would get another one
+    if '\x00' in password:
+        return {'error': 'Password must not contain a NUL character'}, 400
+    sshkey = (data.get('ssh_key') or '').strip()
+    # one OpenSSH public key on one line: cloud-init writes it to authorized_keys as is
+    if sshkey and (len(sshkey) > 4096 or
+                   not re.fullmatch(r'(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-\S+) [A-Za-z0-9+/=]+( [^\r\n]*)?', sshkey)):
+        return {'error': 'Invalid SSH public key'}, 400
+
+    from pegaprox.utils.rbac import DEFAULT_TENANT_ID as _DT, get_user_clusters as _get_user_clusters
+    tenant_id = user.get('tenant_id') or _DT
+    cluster_id = vc['cluster_id']; node = vc['node']
+    # the quota counts the tenant's clusters, so the target has to be one of them (see _create_ct)
+    try:
+        _allowed = _get_user_clusters(dict(user, tenant_id=tenant_id))
+    except Exception:
+        logging.exception('[client_portal] could not resolve the caller\'s clusters')
+        return {'error': 'Cannot verify your quota right now - try again shortly'}, 503
+    if _allowed is not None and cluster_id not in _allowed:
+        logging.error(f"[client_portal] vm_create targets {cluster_id!r}, which is outside "
+                      f"tenant {tenant_id!r} - refusing")
+        return {'error': 'VM creation is not configured for your account'}, 403
+
+    mgr = cluster_managers.get(cluster_id)
+    if not mgr or not mgr.is_connected:
+        return {'error': 'Target cluster is currently unavailable'}, 503
+    tpl = _vm_templates(mgr, vc).get(template)
+    if not tpl:
+        return {'error': 'Selected template is not allowed'}, 400
+    # PVE refuses to shrink a disk, and answers the refusal in the resize task, not the request
+    tpl_disk = (tpl.get('maxdisk') or 0) / 1024 ** 3
+    if disk < tpl_disk:
+        return {'error': f'Disk must be at least {int(-(-tpl_disk // 1))} GB for this template'}, 400
+
+    # one lock per tenant around the quota check, the VMID pick and the whole clone: the new
+    # guest shows on /cluster/resources without cores or memory until pvestatd fills its row,
+    # so a second create may only measure once this one is configured
+    from pegaprox.utils.rbac import check_tenant_quota
+    with _tenant_create_lock(tenant_id):
+        try:
+            q = check_tenant_quota(tenant_id, add_cores=cores, add_mem_gb=memory / 1024.0,
+                                   add_vms=1, add_disk_gb=float(disk))
+        except Exception:
+            logging.exception('[client_portal] quota check failed')
+            return {'error': 'Cannot verify your quota right now - try again shortly'}, 503
+        if q.get('violations') and q.get('enforce') == 'block':
+            return {'error': 'Quota exceeded (' + ', '.join(q['violations']) + ')',
+                    'quota': q.get('quota'), 'usage': q.get('usage')}, 403
+
+        try:
+            new_vmid = _next_tenant_vmid(mgr, tenant_id)
+        except Exception:
+            logging.exception('[client_portal] could not pick a VMID')
+            return {'error': 'Cannot pick a VM id right now - try again shortly'}, 503
+        if new_vmid is None:
+            return {'error': 'No free VM id left in your range - contact your administrator'}, 403
+
+        full = bool(vc.get('full_clone', True))
+        res = mgr.clone_vm(node, template, 'qemu', new_vmid, name=hostname, full=full,
+                           target_storage=vc.get('storage') if full else None,
+                           description=f'Created via Client Portal by {username}')
+        if not res.get('success'):
+            return {'error': 'VM creation failed'}, 500
+
+        err = None
+        upid = res.get('data')
+        if not upid or not mgr._wait_for_task(node, upid, timeout=1800):
+            err = 'cloning the template failed'
+        if not err:
+            from urllib.parse import quote
+            # no bridge is set here, the VM keeps the template's NIC. Had we set a bridge that does
+            # not exist on the node, PVE would accept it and the VM would only fail at its first start
+            ci = {'cores': cores, 'memory': memory, 'ciuser': ciuser, 'cipassword': password,
+                  'ipconfig0': 'ip=dhcp'}
+            if sshkey:
+                ci['sshkeys'] = quote(sshkey, safe='')   # PVE takes sshkeys url-encoded only
+            if not mgr.update_vm_config(node, new_vmid, 'qemu', ci).get('success'):
+                err = 'configuring the VM failed'
+        if not err and disk > tpl_disk:
+            # maxdisk is the boot disk, scsi0 on the templates the Cloud-Init library builds.
+            # Not resize_vm_disk: it answers before PVE has run the resize, and a failed resize
+            # only shows in that task
+            url = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/qemu/{new_vmid}/resize"
+            try:
+                resp = mgr._api_put(url, data={'disk': 'scsi0', 'size': f'{disk}G'})
+                upid = resp.json().get('data') if resp.status_code == 200 else None
+            except Exception:
+                # _api_put passes a timeout or a dropped connection on; the clone still has to go
+                logging.exception(f'[client_portal] resizing VM {new_vmid} failed')
+                upid = None
+            if not upid or not mgr._wait_for_task(node, upid, timeout=600):
+                err = 'resizing the disk failed'
+        if err:
+            logging.error(f'[client_portal] VM {new_vmid} for {username}: {err} - removing it')
+            mgr.delete_vm(node, new_vmid, 'qemu', purge=True, destroy_unreferenced=True)
+            return {'error': f'VM creation failed ({err})'}, 500
+
+    try:
+        from pegaprox.utils.rbac import save_vm_acls
+        acls = load_vm_acls()
+        acls.setdefault(cluster_id, {})[str(new_vmid)] = {'users': [username]}
+        save_vm_acls(acls)
+    except Exception as e:
+        logging.warning(f'[client_portal] VM {new_vmid} created but ACL grant failed: {e}')
+
+    from pegaprox.utils.audit import log_audit
+    log_audit(username, 'portal.vm_created',
+              f'Client portal: created VM "{hostname}" (VM {new_vmid}) from template {template} on {cluster_id}/{node}',
+              cluster=mgr.config.name, cluster_id=cluster_id)
+    return {'success': True, 'vmid': new_vmid, 'cluster_id': cluster_id, 'hostname': hostname}
+
+
 def _destroy_options():
     """#556 — portal probe: is self-service teardown enabled by the hoster?
     The frontend uses this (not the public /config blob) to decide whether to
@@ -1052,6 +1273,8 @@ def register(app):
     register_plugin_route('client_portal', 'my-vms', _get_my_vms)
     register_plugin_route('client_portal', 'ct/create-options', _ct_create_options)
     register_plugin_route('client_portal', 'ct/create', _create_ct)
+    register_plugin_route('client_portal', 'vm/create-options', _vm_create_options)
+    register_plugin_route('client_portal', 'vm/create', _create_vm)
     register_plugin_route('client_portal', 'vm/destroy-options', _destroy_options)
     register_plugin_route('client_portal', 'vm/destroy', _destroy_guest)
     register_plugin_route('client_portal', 'vm/power', _vm_power)

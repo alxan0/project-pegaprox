@@ -22,5 +22,16 @@
         "max_cores": 2,
         "max_memory_mb": 2048,
         "max_disk_gb": 16
+    },
+    "allow_vm_create": false,
+    "vm_create": {
+        "cluster_id": "",
+        "node": "",
+        "storage": "local-lvm",
+        "templates": [],
+        "full_clone": true,
+        "max_cores": 2,
+        "max_memory_mb": 2048,
+        "max_disk_gb": 32
     }
 }

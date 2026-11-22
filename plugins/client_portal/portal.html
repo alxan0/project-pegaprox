@@ -365,7 +365,7 @@ async function checkSess(){
 }
 
 // DATA
-async function loadCfg(){try{const r=await api(`${P}/config`);if(r&&r.ok)S.cfg=await r.json();}catch(e){} try{const ro=await api(`${P}/ct/create-options`);if(ro&&ro.ok)S.ctOpts=await ro.json();}catch(e){} try{const rd=await api(`${P}/vm/destroy-options`);if(rd&&rd.ok)S.destroyOpts=await rd.json();}catch(e){}}
+async function loadCfg(){try{const r=await api(`${P}/config`);if(r&&r.ok)S.cfg=await r.json();}catch(e){} try{const ro=await api(`${P}/ct/create-options`);if(ro&&ro.ok)S.ctOpts=await ro.json();}catch(e){} try{const rv=await api(`${P}/vm/create-options`);if(rv&&rv.ok)S.vmOpts=await rv.json();}catch(e){} try{const rd=await api(`${P}/vm/destroy-options`);if(rd&&rd.ok)S.destroyOpts=await rd.json();}catch(e){}}
 async function loadVMs(){
     S.loading=true;render();
     try{const r=await api(`${P}/my-vms`);if(r&&r.ok){const d=await r.json();if(d.redirect){window.location.href=d.redirect;return;}S.vms=d.vms||[];}}catch(e){}
@@ -609,6 +609,7 @@ function renderDash(){
             ${!S.user?.totp_enabled?`<button id="b2fa" class="btn btn-ghost text-xs py-1" title="Setup 2FA" style="font-size:13px">&#x1f512; 2FA</button>`:`<span class="text-xs" style="color:#3fb950" title="2FA enabled">&#x2713; 2FA</span>`}
             ${c.allow_password_change?`<button id="bpw" class="btn btn-ghost text-xs py-1" title="Change Password" style="font-size:14px">&#x1f511;</button>`:''}
             ${S.ctOpts&&S.ctOpts.enabled?`<button class="btn btn-accent text-xs py-1" title="Create Container" onclick="pCreateCt()">&#x2795; Container</button>`:''}
+            ${S.vmOpts&&S.vmOpts.enabled?`<button class="btn btn-accent text-xs py-1" title="Create VM" onclick="pCreateVm()">&#x2795; VM</button>`:''}
             <button id="btheme" class="theme-toggle" title="Toggle theme">${themeIcon}</button>
             <button id="br" class="btn btn-ghost text-xs py-1">&#8635;</button>
             <button id="bo" class="btn btn-ghost text-xs py-1">Logout</button>
@@ -690,6 +691,7 @@ function renderModal(){
     if(S.modal.type==='2fa-setup')return render2FAModal();
     if(S.modal.type==='isos')return renderIsoModal();
     if(S.modal.type==='createct')return renderCreateCtModal();
+    if(S.modal.type==='createvm')return renderCreateVmModal();
     if(S.modal.type==='destroy')return renderDestroyModal();
     return'';
 }
@@ -739,6 +741,64 @@ async function submitCreateCt(){
         if(r.ok&&d.success){toast(`Container "${d.hostname}" created (CT ${d.vmid})`,'success');S.modal=null;setTimeout(loadVMs,2500);}
         else toast(d.error||'Create failed','error');}
     else toast('Create failed','error');
+}
+
+// self-service VM creation from an admin-whitelisted template (only when the hoster enabled it)
+function pCreateVm(){S.modal={type:'createvm'};render();}
+function renderCreateVmModal(){
+    const o=S.vmOpts||{}, tmpls=o.templates||[], q=o.quota||{}, u=o.usage||{};
+    const quotaLine=(q.vms||q.cores||q.memory_gb)?`<div class="text-xs mt-1" style="color:var(--muted)">Quota — VMs ${u.vms||0}/${q.vms||'∞'} · Cores ${u.cores||0}/${q.cores||'∞'} · Mem ${Math.round(u.memory_gb||0)}/${q.memory_gb||'∞'} GB</div>`:'';
+    // the disk can't be smaller than the template's, so the minimum follows the picked one (pVmTpl)
+    const diskMin=t=>Math.max(1,t.disk_gb||1), minDisk=tmpls.length?diskMin(tmpls[0]):1;
+    return`<div class="modal-bg" onclick="closeModal()">
+    <div class="card" style="width:100%;max-width:32rem;margin:0 16px;padding:20px" onclick="event.stopPropagation()">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+            <h2 class="font-semibold">&#x2795; New VM</h2>
+            <button class="btn btn-ghost text-xs" style="padding:2px 10px" onclick="closeModal()">&#x2715;</button>
+        </div>
+        ${tmpls.length===0?`<div style="text-align:center;padding:20px;color:var(--muted)"><p>No templates available</p><p class="text-xs mt-2">Ask your administrator to allow VM templates.</p></div>`:`
+        <div class="space-y-3">
+            <div><label class="text-xs" style="color:var(--muted)">Template</label>
+                <select id="vmT" class="input text-sm" onchange="pVmTpl()">${tmpls.map(t=>`<option value="${esc(''+t.vmid)}" data-disk="${diskMin(t)}">${esc(t.name)}${t.disk_gb?` (${esc(''+t.disk_gb)} GB)`:''}</option>`).join('')}</select></div>
+            <div><label class="text-xs" style="color:var(--muted)">Hostname</label>
+                <input id="vmH" class="input text-sm" placeholder="my-vm"></div>
+            <div style="display:flex;gap:8px">
+                <div style="flex:1"><label class="text-xs" style="color:var(--muted)">Cores (1-${o.max_cores||2})</label>
+                    <input id="vmC" type="number" min="1" max="${o.max_cores||2}" value="1" class="input text-sm"></div>
+                <div style="flex:1"><label class="text-xs" style="color:var(--muted)">RAM MB (512-${o.max_memory_mb||2048})</label>
+                    <input id="vmM" type="number" min="512" max="${o.max_memory_mb||2048}" value="1024" class="input text-sm"></div>
+                <div style="flex:1"><label id="vmDL" class="text-xs" style="color:var(--muted)">Disk GB (${minDisk}-${o.max_disk_gb||32})</label>
+                    <input id="vmD" type="number" min="${minDisk}" max="${o.max_disk_gb||32}" value="${minDisk}" class="input text-sm"></div>
+            </div>
+            <div><label class="text-xs" style="color:var(--muted)">Login user name</label>
+                <input id="vmU" class="input text-sm" placeholder="admin" autocomplete="off"></div>
+            <div><label class="text-xs" style="color:var(--muted)">Password (min 8 chars)</label>
+                <input id="vmP" type="password" autocomplete="new-password" class="input text-sm"></div>
+            <div><label class="text-xs" style="color:var(--muted)">SSH public key (optional)</label>
+                <input id="vmK" class="input text-sm" placeholder="ssh-ed25519 AAAA..." autocomplete="off"></div>
+            ${quotaLine}
+            <button id="vmBtn" class="btn btn-accent w-full" style="justify-content:center" onclick="submitCreateVm()">Create VM</button>
+        </div>`}
+    </div></div>`;
+}
+function pVmTpl(){
+    const g=id=>document.getElementById(id), d=g('vmD'), m=+g('vmT').selectedOptions[0].dataset.disk;
+    d.min=m;if(+d.value<m)d.value=m;g('vmDL').textContent=`Disk GB (${m}-${d.max})`;
+}
+async function submitCreateVm(){
+    const g=id=>document.getElementById(id);
+    const body={template:parseInt(g('vmT').value),hostname:(g('vmH').value||'').trim(),
+        cores:parseInt(g('vmC').value||'1'),memory:parseInt(g('vmM').value||'1024'),
+        disk_gb:parseInt(g('vmD').value||'8'),username:(g('vmU').value||'').trim(),
+        password:g('vmP').value||'',ssh_key:(g('vmK').value||'').trim()};
+    // the clone finishes before the answer, which can take a while for a full clone
+    const b=g('vmBtn');if(b){b.disabled=true;b.textContent='Creating…';}
+    const r=await api(`${P}/vm/create`,{method:'POST',body});
+    if(r){const d=await r.json().catch(()=>({}));
+        if(r.ok&&d.success){toast(`VM "${d.hostname}" created (VM ${d.vmid})`,'success');S.modal=null;setTimeout(loadVMs,2500);return;}
+        toast(d.error||'Create failed','error');}
+    else toast('Create failed','error');
+    if(b){b.disabled=false;b.textContent='Create VM';}
 }
 
 function pDestroy(cid,vmid){
@@ -1031,6 +1091,7 @@ window.pDeleteSnap=function(c,v,snapname){const vm=S.vms.find(x=>x.cluster_id===
 // against window, found nothing, and threw ReferenceError — the +Container / Destroy buttons did
 // nothing for everyone with those features enabled. Export them like every other inline handler.
 window.pCreateCt=pCreateCt;window.submitCreateCt=submitCreateCt;window.pDestroy=pDestroy;window.submitDestroy=submitDestroy;
+window.pCreateVm=pCreateVm;window.pVmTpl=pVmTpl;window.submitCreateVm=submitCreateVm;
 // #810 - same shape: the SSO button carries onclick="startOidcLogin()" and the
 // function lives inside the IIFE, so every click threw ReferenceError. That has
 // been the case since the button went in (April), and it was the only inline
